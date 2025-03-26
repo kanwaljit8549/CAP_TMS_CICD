@@ -1,0 +1,218 @@
+_schema-version: 3.3.0
+ID: cap_tms_cicd
+version: 1.0.0
+description: "A simple CAP project."
+parameters:
+  enable-parallel-deployments: true
+  deploy_mode: html5-repo
+build-parameters:
+  before-all:
+    - builder: custom
+      commands:
+        - npm ci
+        - npx cds build --production
+modules:
+  - name: cap_tms_cicd-srv
+    type: nodejs
+    path: gen/srv
+    parameters:
+      instances: 1
+      buildpack: nodejs_buildpack
+    build-parameters:
+      builder: npm-ci
+    provides:
+      - name: srv-api # required by consumers of CAP services (e.g. approuter)
+        properties:
+          srv-url: ${default-url}
+    requires:
+      - name: cap_tms_cicd-auth
+      - name: cap_tms_cicd-messaging
+      - name: cap_tms_cicd-kafka
+      - name: cap_tms_cicd-connectivity
+      - name: cap_tms_cicd-destination
+      - name: cap_tms_cicd-db
+
+  - name: cap_tms_cicd-mtx
+    type: nodejs
+    path: gen/mtx/sidecar
+    build-parameters:
+      builder: npm-ci
+    parameters:
+      instances: 1
+      memory: 256M
+      disk-quota: 512M
+    provides:
+      - name: mtx-api
+        properties:
+          mtx-url: ${default-url}
+    requires:
+      - name: cap_tms_cicd-registry
+      - name: cap_tms_cicd-auth
+      - name: app-api
+        properties:
+          SUBSCRIPTION_URL: ~{app-protocol}://\${tenant_subdomain}-~{app-uri}
+      - name: cap_tms_cicd-destination
+      - name: cap_tms_cicd-db
+      - name: cap_tms_cicd-html5-runtime
+
+  - name: cap_tms_cicd
+    type: approuter.nodejs
+    path: app/router
+    parameters:
+      keep-existing-routes: true
+      disk-quota: 256M
+      memory: 256M
+    requires:
+      - name: srv-api
+        group: destinations
+        properties:
+          name: srv-api # must be used in xs-app.json as well
+          url: ~{srv-url}
+          forwardAuthToken: true
+      - name: cap_tms_cicd-auth
+      - name: mtx-api
+        group: destinations
+        properties:
+          name: mtx-api # must be used in xs-app.json as well
+          url: ~{mtx-url}
+      - name: cap_tms_cicd-destination
+      - name: cap_tms_cicd-html5-runtime
+    provides:
+      - name: app-api
+        properties:
+          app-protocol: ${protocol}
+          app-uri: ${default-uri}
+    properties:
+      TENANT_HOST_PATTERN: "^(.*)-${default-uri}"
+
+  - name: cap_tms_cicd-app-deployer
+    type: com.sap.application.content
+    path: gen
+    requires:
+      - name: cap_tms_cicd-html5-repo-host
+        parameters:
+          content-target: true
+    build-parameters:
+      build-result: app/
+      requires:
+
+
+  - name: notification-content-deployment
+    type: nodejs
+    path: gen/srv
+    parameters:
+      no-route: true
+      no-start: true
+      memory: 256MB
+      disk-quota: 1GB
+      tasks:
+        - name: notification-content-deployment
+          command: "node node_modules/@cap-js/notifications/lib/content-deployment.js"
+          memory: 256MB
+          disk-quota: 1GB
+    requires:
+      - name: cap_tms_cicd-destination
+      - name: cap_tms_cicd-auth
+      - name: cap_tms_cicd-db
+    provides:
+      - name: srv-api # required by consumers of CAP services (e.g. approuter)
+        properties:
+          srv-url: ${default-url}
+
+  - name: cap_tms_cicd-db-deployer
+    type: hdb
+    path: gen/db
+    parameters:
+      buildpack: nodejs_buildpack
+    requires:
+      - name: cap_tms_cicd-db
+resources:
+  - name: cap_tms_cicd-auth
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+      config:
+        xsappname: cap_tms_cicd-${org}-${space}
+        tenant-mode: shared
+  - name: cap_tms_cicd-registry
+    type: org.cloudfoundry.managed-service
+    requires:
+      - name: mtx-api
+    parameters:
+      service: saas-registry
+      service-plan: application
+      config:
+        xsappname: cap_tms_cicd-${org}-${space}
+        appName: cap_tms_cicd-${org}-${space}
+        displayName: cap_tms_cicd
+        description: A simple CAP project.
+        category: 'Category'
+        appUrls:
+          getDependencies: ~{mtx-api/mtx-url}/-/cds/saas-provisioning/dependencies
+          onSubscription: ~{mtx-api/mtx-url}/-/cds/saas-provisioning/tenant/{tenantId}
+          onSubscriptionAsync: true
+          onUnSubscriptionAsync: true
+          onUpdateDependenciesAsync: true
+          callbackTimeoutMillis: 300000 # Increase if your deployments are taking longer than that
+  - name: cap_tms_cicd-messaging
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: enterprise-messaging
+      service-plan: default
+      path: ./event-mesh.json
+  - name: cap_tms_cicd-kafka
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: kafka
+      service-plan: standard
+  - name: cap_tms_cicd-db
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: service-manager
+      service-plan: container
+  - name: cap_tms_cicd-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+  - name: cap_tms_cicd-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+      config:
+        HTML5Runtime_enabled: true
+        init_data:
+          instance:
+            existing_destinations_policy: update
+            destinations:
+              - Name: cap_tms_cicd-srv-api
+                URL: ~{srv-api/srv-url}
+                Authentication: NoAuthentication
+                Type: HTTP
+                ProxyType: Internet
+                HTML5.ForwardAuthToken: true
+                HTML5.DynamicDestination: true
+              - Name: ui5
+                URL: https://ui5.sap.com
+                Authentication: NoAuthentication
+                Type: HTTP
+                ProxyType: Internet
+
+  - name: cap_tms_cicd-html5-repo-host
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-host
+  - name: cap_tms_cicd-html5-runtime
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-runtime
+  - name: cap_tms_cicd-db
+    type: com.sap.xs.hdi-container
+    parameters:
+      service: hana
+      service-plan: hdi-shared
